@@ -36,6 +36,7 @@ from ..runtime.hybrid_dlrm import (
     sync_device,
 )
 from ..runtime.recstore_distributed import ShardedRecstoreClient
+from ..runtime.lookahead_cache import LookaheadCacheManager
 from ..runtime.report import finalize_recstore_row, summarize_us, write_stage_csv
 from .base import BenchmarkRunner
 
@@ -742,6 +743,15 @@ class RecStoreRunner(BenchmarkRunner):
                 cfg,
                 embedding_dim=cfg.embedding_dim,
             )
+            lookahead_cache_mgr: LookaheadCacheManager | None = None
+            if cfg.enable_gpu_cache and cfg.prefetch_depth > 0 and cfg.enable_lookahead_cache:
+                lookahead_cache_mgr = LookaheadCacheManager(
+                    kv_client=client,
+                    embedding_module=embedding_module,
+                    lookahead=cfg.prefetch_depth,
+                    cleanup_batch_proportion=cfg.lookahead_cache_cleanup_proportion,
+                    capacity=cfg.gpu_cache_capacity,
+                )
             _append_worker_debug(
                 cfg,
                 rank,
@@ -852,6 +862,34 @@ class RecStoreRunner(BenchmarkRunner):
                 return row, time.perf_counter(), dense_batch, sparse_features, labels_batch
 
             data_iter_state = {"iter": data_iter}
+
+            if lookahead_cache_mgr is not None:
+                _append_worker_debug(
+                    cfg, rank,
+                    f"lookahead_cache scanning {cfg.prefetch_depth} batches "
+                    f"with capacity={cfg.gpu_cache_capacity}"
+                )
+                lookahead_batch_ids: list[set[int]] = []
+                lookahead_data_iter = iter(dataloader)
+                for _ in range(min(cfg.prefetch_depth, cfg.steps)):
+                    try:
+                        _, sparse_batch, _ = next(lookahead_data_iter)
+                    except StopIteration:
+                        lookahead_data_iter = iter(dataloader)
+                        _, sparse_batch, _ = next(lookahead_data_iter)
+                    sparse_cpu = sparse_batch.to(torch.int64).cpu()
+                    fused_set: set[int] = set()
+                    for table_idx in range(sparse_cpu.shape[1]):
+                        for val in sparse_cpu[:, table_idx].tolist():
+                            fused_set.add(int(val) + (table_idx << int(cfg.fuse_k)))
+                    lookahead_batch_ids.append(fused_set)
+                lookahead_cache_mgr.scan_batches(lookahead_batch_ids)
+                _append_worker_debug(
+                    cfg, rank,
+                    f"lookahead_cache scanned {len(lookahead_batch_ids)} batches, "
+                    f"ttl_size={len(lookahead_cache_mgr._ttl)}"
+                )
+
             for step in range(cfg.steps):
                 while (
                     len(prepared_batches) <= lookahead_prefetcher.depth
@@ -872,6 +910,10 @@ class RecStoreRunner(BenchmarkRunner):
                 _reset_perf_stats(embedding_module)
                 _reset_perf_stats(sparse_optimizer)
                 lookahead_prefetcher.reset_stats()
+                if lookahead_cache_mgr is not None and step < len(lookahead_batch_ids):
+                    lookahead_cache_mgr.on_batch_start(
+                        step, lookahead_batch_ids[step]
+                    )
                 sparse_optimizer.zero_grad()
                 embeddings = None
                 with stage_timer(row, "embed_lookup_local_ms"):
@@ -981,6 +1023,21 @@ class RecStoreRunner(BenchmarkRunner):
                 ) * 1e3
                 row["step_total_ms"] = (time.perf_counter() - step_start) * 1e3
                 rows.append(finalize_recstore_row(row))
+                if lookahead_cache_mgr is not None:
+                    lookahead_cache_mgr.on_batch_end(step)
+                    _merge_numeric_fields(
+                        row,
+                        lookahead_cache_mgr.consume_stats(reset=False),
+                        (
+                            "lookahead_depth",
+                            "lookahead_cleanup_interval",
+                            "lookahead_total_prefetched",
+                            "lookahead_total_evicted",
+                            "lookahead_prefetch_ms",
+                            "lookahead_evict_ms",
+                            "lookahead_current_occupancy",
+                        ),
+                    )
                 _barrier_for_step_alignment(
                     dist=dist,
                     device=device,
